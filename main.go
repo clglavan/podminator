@@ -191,9 +191,6 @@ func updateList(searchQuery string, pods []v1.Pod, list *tview.List, app *tview.
 			list.AddItem(pod.Name, "", 0, nil)
 		}
 	}
-	list.AddItem("Quit", "Press to exit", 'q', func() {
-		app.Stop()
-	})
 }
 
 // Create the application
@@ -307,7 +304,7 @@ func main() {
 
 	// Create the grid layout for the UI
 	grid := tview.NewGrid().
-		SetRows(3, 1, 0).
+		SetRows(3, 4, 0).
 		SetColumns(0, 0).
 		SetBorders(true).
 		AddItem(helperText, 0, 0, 1, 2, 0, 0, false).
@@ -415,6 +412,8 @@ func main() {
 				setFocusHighlight(searchInput)
 				return nil
 			}
+		case 'q', 'Q':
+			app.Stop()
 		}
 
 		// Arrow key navigation between podList and secondSection
