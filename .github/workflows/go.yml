@@ -1,0 +1,66 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build Go Project
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout the code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+
+      # Build for Linux, Windows, and MacOS
+      - name: Build binaries
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o build/podminator-linux-amd64
+          GOOS=windows GOARCH=amd64 go build -o build/podminator-windows-amd64.exe
+          GOOS=darwin GOARCH=amd64 go build -o build/podminator-darwin-amd64
+
+      # Upload build artifacts to release
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      # Upload binaries to the GitHub Release
+      - name: Upload Release Assets
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: build/podminator-linux-amd64
+          asset_name: podminator-linux-amd64
+          asset_content_type: application/octet-stream
+
+      - name: Upload Windows binary
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: build/podminator-windows-amd64.exe
+          asset_name: podminator-windows-amd64.exe
+          asset_content_type: application/octet-stream
+
+      - name: Upload MacOS binary
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: build/podminator-darwin-amd64
+          asset_name: podminator-darwin-amd64
+          asset_content_type: application/octet-stream
