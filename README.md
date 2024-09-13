@@ -34,6 +34,8 @@ cd podminator
 go build -o podminator main.go
 ```
 
+Or use the [Makefile](Makefile)
+
 ### Run the Project
 
 ```bash
