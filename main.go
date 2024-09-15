@@ -311,7 +311,7 @@ func setFocusHighlight(focusedView tview.Primitive) {
 
 // Function to update the helper text with the last refresh timestamp
 func updateHelperText(helperText *tview.TextView) {
-	helperText.SetText(fmt.Sprintf("[::b]Podminator[::d]\n [yellow]'o'[-] Toggle Terminals | [yellow]'l'[-] Logs | [yellow]'t'[-] Tail Logs | [yellow]'e'[-] Exec | [yellow]'E'[-] (SHIFT+e) Exec with custom command | [yellow]'i'[-] Info | [yellow]'y'[-] YAML | [yellow]'n'[-] Namespace | [yellow]'s'[-] Search | [yellow]'q'[-] Quit \nPods are refreshed every 5 seconds - last timestamp: [yellow]%s[-]", lastRefreshed)).
+	helperText.SetText(fmt.Sprintf("[::b]Podminator[::d]\n [yellow]'o'[-] Toggle Terminals | [yellow]'l'[-] Logs | [yellow]'t'[-] Tail Logs | [yellow]'e'[-] Exec | [yellow]'E'[-] (SHIFT+e) Exec with custom command | [yellow]'i'[-] Info | [yellow]'y'[-] YAML | [yellow]'n'[-] Namespace | [yellow]'s'[-] Search |  [yellow]'spacebar'[-] Jump to bottom (Pod output) | [yellow]'q'[-] Quit \nPods are refreshed every 5 seconds - last timestamp: [yellow]%s[-]", lastRefreshed)).
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
 }
@@ -417,6 +417,18 @@ func main() {
 		SetTextAlign(tview.AlignLeft).
 		SetScrollable(true).
 		SetText("Output will be displayed here")
+
+		// Bind the "space" key to scroll to the bottom in the secondSection
+	secondSection.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyRune:
+			if event.Rune() == ' ' { // Space key
+				secondSection.ScrollToEnd() // Scroll to the bottom
+				return nil
+			}
+		}
+		return event
+	})
 
 	// Dropdown for selecting namespaces
 	namespaceDropdown.
