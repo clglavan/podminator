@@ -110,9 +110,10 @@ func runTailLogsInTerminal(podName, podNamespace, containerName string) {
 	}
 }
 
-func runExecInTerminal(podName, podNamespace, containerName string) {
-	command := fmt.Sprintf("kubectl exec -it %s --namespace=%s -c %s -- /bin/sh", podName, podNamespace, containerName)
-	err := runInTerminal(command)
+// Updated `runExecInTerminal` function to accept custom command
+func runExecInTerminal(podName, podNamespace, containerName, command string) {
+	fullCommand := fmt.Sprintf("kubectl exec -it %s --namespace=%s -c %s -- %s", podName, podNamespace, containerName, command)
+	err := runInTerminal(fullCommand)
 	if err != nil {
 		log.Printf("Error running command in terminal: %v", err)
 	}
@@ -185,12 +186,90 @@ func updatePodList(clientset *kubernetes.Clientset, selectedNamespace string) ([
 
 // Function to update the UI pod list based on the search query
 func updateList(searchQuery string, pods []v1.Pod, list *tview.List, app *tview.Application) {
-	list.Clear()
+	list.Clear() // Clear the existing list
+
+	// Check if the pod list is empty
+	if len(pods) == 0 {
+		list.AddItem("No pods found in this namespace", "", 0, nil) // Show the message if no pods exist
+		return
+	}
+
+	// Populate the list with pods matching the search query
 	for _, pod := range pods {
 		if strings.Contains(strings.ToLower(pod.Name), strings.ToLower(searchQuery)) {
 			list.AddItem(pod.Name, "", 0, nil)
 		}
 	}
+}
+
+// Function to show the exec modal with a default command input field
+func showExecCommandModal(app *tview.Application, podName string, podNamespace string, containerName string, grid *tview.Grid) {
+	// Set modalActive to true to track that modal is open
+	modalActive = true
+
+	// Instructional text to explain the modal functionality and navigation
+	instructionText := tview.NewTextView().
+		SetText("Enter the command to execute in the pod. Use TAB to switch between fields.").
+		SetTextAlign(tview.AlignCenter).
+		SetDynamicColors(true).
+		SetTextColor(tcell.ColorYellow)
+
+	// Create a new InputField for the exec command with a default value of "/bin/sh"
+	commandInput := tview.NewInputField().
+		SetLabel("Command: ").
+		SetText("/bin/sh").
+		SetFieldWidth(30) // Set a reasonable width for the input field
+
+	// Create a form and add the InputField and buttons (Run and Cancel)
+	form := tview.NewForm().
+		AddFormItem(commandInput). // Add the input field to the form
+		AddButton("Run", func() {
+			// Get the command entered by the user
+			command := commandInput.GetText()
+
+			// If no command was entered, use the default "/bin/sh"
+			if command == "" {
+				command = "/bin/sh"
+			}
+
+			// Run the exec command with the user-specified command
+			runExecInTerminal(podName, podNamespace, containerName, command)
+
+			// Close the modal and return focus to the main grid
+			modalActive = false
+			app.SetRoot(grid, true).SetFocus(podList)
+			setFocusHighlight(podList)
+		}).
+		AddButton("Cancel", func() {
+			// Close the modal and return focus to the main grid when Cancel is pressed
+			modalActive = false
+			app.SetRoot(grid, true).SetFocus(podList)
+			setFocusHighlight(podList)
+		})
+
+	// Create a centered Flex layout to hold the form and instructional text
+	flex := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(nil, 0, 1, false).             // Add empty space at the top (flexible)
+		AddItem(instructionText, 3, 1, false). // Add instructional text
+		AddItem(
+			tview.NewFlex().SetDirection(tview.FlexColumn).
+				AddItem(nil, 0, 1, false).  // Add empty space to the left
+				AddItem(form, 40, 1, true). // Center form horizontally (fixed width of 60)
+				AddItem(nil, 0, 1, false),  // Add empty space to the right
+						0, 1, true). // Increase vertical space to ensure input is visible
+		AddItem(nil, 0, 1, false) // Add empty space at the bottom (flexible)
+
+	// Ensure that the form is navigable with arrow keys or tab and that buttons are clickable
+	form.SetCancelFunc(func() {
+		// Close the modal and return focus to the main grid when Escape is pressed
+		modalActive = false
+		app.SetRoot(grid, true).SetFocus(podList)
+		setFocusHighlight(podList)
+	})
+
+	// Set the focus on the command input field initially
+	app.SetRoot(flex, true).SetFocus(commandInput)
 }
 
 // Create the application
@@ -272,7 +351,7 @@ func main() {
 
 	// Helper text at the top of the UI
 	helperText.
-		SetText("[::b]Podminator[::d]\n 'o' Toggle Terminals | 'l' Logs | 't' Tail Logs | 'e' Exec | 'i' Info | 'y' YAML | 'n' Namespace | 's' Search | 'q' Quit").
+		SetText("[::b]Podminator[::d]\n 'o' Toggle Terminals | 'l' Logs | 't' Tail Logs | 'e' Exec | 'E' (SHIFT+e) Exec with custom command | 'i' Info | 'y' YAML | 'n' Namespace | 's' Search | 'q' Quit").
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
 
@@ -298,13 +377,14 @@ func main() {
 				log.Fatalf("Error updating pod list: %v", err)
 			}
 			updateList("", allPods, podList, app)
+			podList.SetCurrentItem(0) // This sets the focus to the first item in the list
 			setFocusHighlight(podList)
 		}).
 		SetCurrentOption(0)
 
 	// Create the grid layout for the UI
 	grid := tview.NewGrid().
-		SetRows(3, 4, 0).
+		SetRows(3, 1, 0).
 		SetColumns(0, 0).
 		SetBorders(true).
 		AddItem(helperText, 0, 0, 1, 2, 0, 0, false).
@@ -373,13 +453,28 @@ func main() {
 				runTailLogsInTerminal(podName, podNamespace, containers[0].Name)
 			}
 			return nil
-		case 'e', 'E':
+		case 'e':
+			// Handle the case where there are multiple containers
 			if len(containers) > 1 {
 				showContainerSelectionModal(app, podName, containers, func(containerName string) {
-					runExecInTerminal(podName, podNamespace, containerName) // Open exec in new terminal
+					// Show the exec command modal with the custom input field
+					runExecInTerminal(podName, podNamespace, containerName, "/bin/sh")
 				}, grid)
 			} else {
-				runExecInTerminal(podName, podNamespace, containers[0].Name) // Open exec in new terminal
+				// Directly show the exec command modal for a single container
+				runExecInTerminal(podName, podNamespace, containers[0].Name, "/bin/sh")
+			}
+			return nil
+		case 'E':
+			// Handle the case where there are multiple containers
+			if len(containers) > 1 {
+				showContainerSelectionModal(app, podName, containers, func(containerName string) {
+					// Show the exec command modal with the custom input field
+					showExecCommandModal(app, podName, podNamespace, containerName, grid)
+				}, grid)
+			} else {
+				// Directly show the exec command modal for a single container
+				showExecCommandModal(app, podName, podNamespace, containers[0].Name, grid)
 			}
 			return nil
 		}
