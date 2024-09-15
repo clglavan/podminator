@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -23,6 +24,7 @@ var useNewTerminal = false    // Toggle to switch between terminal output or dis
 var selectedNamespace = "all" // Default namespace selection
 var namespaceOptions []string // Stores available namespace options
 var modalActive bool = false  // Tracks if the modal is currently active
+var lastRefreshed string      // Stores the last refresh timestamp
 
 // Function to detect which terminal application is being used (macOS-specific)
 func detectTerminalProgram() string {
@@ -307,6 +309,49 @@ func setFocusHighlight(focusedView tview.Primitive) {
 	}
 }
 
+// Function to update the helper text with the last refresh timestamp
+func updateHelperText(helperText *tview.TextView) {
+	helperText.SetText(fmt.Sprintf("[::b]Podminator[::d]\n [yellow]'o'[-] Toggle Terminals | [yellow]'l'[-] Logs | [yellow]'t'[-] Tail Logs | [yellow]'e'[-] Exec | [yellow]'E'[-] (SHIFT+e) Exec with custom command | [yellow]'i'[-] Info | [yellow]'y'[-] YAML | [yellow]'n'[-] Namespace | [yellow]'s'[-] Search | [yellow]'q'[-] Quit \nPods are refreshed every 5 seconds - last timestamp: [yellow]%s[-]", lastRefreshed)).
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter)
+}
+
+func periodicPodRefresh(clientset *kubernetes.Clientset, app *tview.Application, podList *tview.List, helperText *tview.TextView, selectedNamespace string, searchQuery string) {
+	// Create a ticker to trigger the refresh every 5 seconds
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Fetch the updated list of pods
+			pods, err := updatePodList(clientset, selectedNamespace)
+			if err != nil {
+				log.Printf("Error retrieving pods: %v", err)
+				continue
+			}
+
+			// Get the current selected pod
+			currentIndex := podList.GetCurrentItem()
+
+			// Update the last refreshed time
+			lastRefreshed = time.Now().Format("15:04:05") // Get the current time in HH:MM:SS format
+
+			// Run the update on the app's main event loop
+			app.QueueUpdateDraw(func() {
+				updateList(searchQuery, pods, podList, app)
+
+				// Restore the previously selected pod index after refreshing
+				if currentIndex >= 0 && currentIndex < podList.GetItemCount() {
+					podList.SetCurrentItem(currentIndex)
+				}
+
+				updateHelperText(helperText) // Update the helper text with the new timestamp
+			})
+		}
+	}
+}
+
 func main() {
 	// Set up Kubernetes client configuration
 	var kubeconfig *string
@@ -349,11 +394,18 @@ func main() {
 		log.Fatalf("Error retrieving pods: %v", err)
 	}
 
+	// Initialize the lastRefreshed variable with the current timestamp
+	lastRefreshed = time.Now().Format("15:04:05")
+
 	// Helper text at the top of the UI
-	helperText.
-		SetText("[::b]Podminator[::d]\n 'o' Toggle Terminals | 'l' Logs | 't' Tail Logs | 'e' Exec | 'E' (SHIFT+e) Exec with custom command | 'i' Info | 'y' YAML | 'n' Namespace | 's' Search | 'q' Quit").
-		SetDynamicColors(true).
-		SetTextAlign(tview.AlignCenter)
+	// helperText.
+	// 	SetText("[::b]Podminator[::d]\n 'o' Toggle Terminals | 'l' Logs | 't' Tail Logs | 'e' Exec | 'E' (SHIFT+e) Exec with custom command | 'i' Info | 'y' YAML | 'n' Namespace | 's' Search | 'q' Quit").
+	// 	SetDynamicColors(true).
+	// 	SetTextAlign(tview.AlignCenter)
+
+	// Helper text at the top of the UI
+	helperText := tview.NewTextView()
+	updateHelperText(helperText)
 
 	// Search input for filtering the pod list
 	searchInput.
@@ -522,6 +574,9 @@ func main() {
 		}
 		return event
 	})
+
+	// Launch the pod refresh function in the background
+	go periodicPodRefresh(clientset, app, podList, helperText, selectedNamespace, "")
 
 	// Run the application
 	if err := app.SetRoot(grid, true).Run(); err != nil {
