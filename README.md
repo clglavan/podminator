@@ -12,6 +12,10 @@ Podminator is a terminal-based Kubernetes pod management tool built using the `t
 - **Namespace Switching:** Easily switch between different namespaces.
 - **UI Output or Terminal:** Toggle between displaying command output in the terminal UI or a new terminal window.
 - **Multi-container Pods:** Support for pods with multiple containers, allowing you to choose which container to interact with.
+- **Auto refresh Pods:** Automatically refresh pods every 5 seconds
+Coming soon:
+- **Support for extra resources:** Allow see and edit extra resources like deployment, configmap, secrets, pvc, volumes, HPA, Ingress.
+- **Special commands:** Debug running pods by cloning them and debug by cloning the image locally.
 
 ## Building
 
@@ -64,8 +68,9 @@ Once you run the `podminator` executable, you will see a terminal user interface
 |---------------|-----------------------------------------|
 | `o`           | Toggle between terminal output and UI output |
 | `l`           | View pod logs                           |
-| `t`           | Tail logs in real-time                  |
+| `t`           | Tail logs in real-time (new terminal)   |
 | `e`           | Execute a shell command in a pod        |
+| `E` (Shift+e) | Open modal, enter custom command for exec |
 | `i`           | Show detailed pod information (describe) |
 | `y`           | Show pod YAML                           |
 | `n`           | Switch between namespaces               |
@@ -79,7 +84,9 @@ For pods with multiple containers, Podminator presents a modal allowing you to c
 
 ### Toggle Terminal Output
 
-By default, Podminator displays command output directly in the UI. However, you can toggle between UI output and opening a new terminal window for commands such as logs and `kubectl exec` using the `o` key.
+By default, Podminator displays some command output directly in the UI (like describe, logs, yaml). However, you can toggle between UI output and opening a new terminal window for commands using the `o` key.
+
+For exec and tail commands (ones that require an interactive input) the output will always be send to a new native terminal window.
 
 ## Development
 
@@ -114,7 +121,7 @@ Alternatively, you can press `t` to tail the logs and see real-time updates from
 ### Common Issues
 
 - **No Pods Listed:** Ensure your kubeconfig is properly set and you have access to the cluster.
-- **Modal Not Responding:** When using modals, ensure to press the appropriate keys for navigation (`Enter` to select and arrow keys to move between options).
+- **Modal Not Responding:** When using modals, ensure to press the appropriate keys for navigation (`Enter` to select and arrow/tab keys to move between options).
 
 ### Logs
 
