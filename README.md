@@ -13,6 +13,7 @@ Podminator is a terminal-based Kubernetes pod management tool built using the `t
 - **UI Output or Terminal:** Toggle between displaying command output in the terminal UI or a new terminal window.
 - **Multi-container Pods:** Support for pods with multiple containers, allowing you to choose which container to interact with.
 - **Auto refresh Pods:** Automatically refresh pods every 5 seconds
+- 
 Coming soon:
 - **Support for extra resources:** Allow see and edit extra resources like deployment, configmap, secrets, pvc, volumes, HPA, Ingress.
 - **Special commands:** Debug running pods by cloning them and debug by cloning the image locally.
