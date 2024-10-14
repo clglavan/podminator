@@ -8,25 +8,48 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort" // Added import for sorting
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
 
-var useNewTerminal = false    // Toggle to switch between terminal output or displaying output in the UI
-var selectedNamespace = "all" // Default namespace selection
-var namespaceOptions []string // Stores available namespace options
-var modalActive bool = false  // Tracks if the modal is currently active
-var lastRefreshed string      // Stores the last refresh timestamp
+// Global variables
+var (
+	useNewTerminal    = false  // Toggle to switch between terminal output or displaying output in the UI
+	selectedNamespace = "all"  // Default namespace selection
+	namespaceOptions  []string // Stores available namespace options
+	modalActive       bool     // Tracks if the modal is currently active
+	lastRefreshed     string   // Stores the last refresh timestamp
+	app               *tview.Application
+	treeView          *tview.TreeView
+	helperText        *tview.TextView
+	searchInput       *tview.InputField
+	secondSection     *tview.TextView
+	namespaceDropdown *tview.DropDown
+	modal             *tview.Modal
+	clientset         *kubernetes.Clientset
+	grid              *tview.Grid
+	mu                sync.Mutex // Mutex to protect access to shared variables
+	isPodHighlighted  bool
 
-// Function to detect which terminal application is being used (macOS-specific)
+	// Added for preserving expansion state and selected pod
+	namespaceExpansionState = make(map[string]bool)
+	dynamicClient           dynamic.Interface
+	k8sClientsReady         = make(chan struct{})
+)
+
 func detectTerminalProgram() string {
 	termProgram := os.Getenv("TERM_PROGRAM")
 	if termProgram == "" {
@@ -44,18 +67,18 @@ func runInTerminal(command string) error {
 	case "iTerm.app":
 		// AppleScript for iTerm2
 		appleScript = fmt.Sprintf(`tell application "iTerm"
-		create window with default profile
-		tell current session of current window
-			write text "bash -c '%s'"
-		end tell
-	end tell`, strings.ReplaceAll(command, "'", "'\\''"))
+            create window with default profile
+            tell current session of current window
+                write text "bash -c '%s'"
+            end tell
+        end tell`, strings.ReplaceAll(command, "'", "'\\''"))
 	default:
 		// Default AppleScript for macOS Terminal
 		appleScript = fmt.Sprintf(`tell application "Terminal"
-		do script "bash -c '%s'"
-		set bounds of front window to {100, 100, 1100, 700}
-		activate
-	end tell`, strings.ReplaceAll(command, "'", "'\\''"))
+            do script "bash -c '%s'"
+            set bounds of front window to {100, 100, 1100, 700}
+            activate
+        end tell`, strings.ReplaceAll(command, "'", "'\\''"))
 	}
 
 	// Run the AppleScript using `osascript`
@@ -90,13 +113,15 @@ func showContainerSelectionModal(app *tview.Application, podName string, contain
 	// Handle the "Done" function of the modal when a container is selected
 	modal.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 		if buttonLabel != "" {
-			commandFunc(buttonLabel) // Execute the command for the selected container
+			// Execute the command for the selected container
+			commandFunc(buttonLabel)
+			// Do not reset the modal state here
+		} else {
+			// If no buttonLabel (e.g., user cancels), close the modal
+			modalActive = false
+			app.SetRoot(grid, true).SetFocus(treeView)
+			setFocusHighlight(treeView)
 		}
-
-		// Restore focus to the main grid and reset the modal state
-		modalActive = false
-		app.SetRoot(grid, true).SetFocus(treeView)
-		setFocusHighlight(treeView)
 	})
 
 	// Display the modal and focus on it
@@ -170,179 +195,364 @@ func runDescribeCommand(podName, podNamespace string, secondSection *tview.TextV
 	}
 }
 
-// Create the application
-var app = tview.NewApplication()
+// Debounce function to limit the rate of function calls
+func debounce(f func(), delay time.Duration) func() {
+	var timer *time.Timer
+	return func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		timer = time.AfterFunc(delay, f)
+	}
+}
 
-// Create a tree view for displaying namespaces and pods
-var treeView = tview.NewTreeView()
+// Function to record expansion states of namespace nodes
+func recordExpansionState(node *tview.TreeNode) {
+	// If the node is a namespace node (level 1)
+	if node.GetLevel() == 1 {
+		namespaceName := node.GetText()
+		namespaceExpansionState[namespaceName] = node.IsExpanded()
+	}
 
-// Various UI elements (text view, input field, dropdown, modal)
-var helperText = tview.NewTextView()
-var searchInput = tview.NewInputField()
-var secondSection = tview.NewTextView()
-var namespaceDropdown = tview.NewDropDown()
-var modal = tview.NewModal()
+	// Recursively traverse child nodes
+	for _, child := range node.GetChildren() {
+		recordExpansionState(child)
+	}
+}
 
-// Function to update the tree view with namespaces and pods
-// Function to update the tree view with namespaces and pods
+// Updated updatePodTreeView function
 func updatePodTreeView(clientset *kubernetes.Clientset, selectedNamespace string, tree *tview.TreeView, app *tview.Application, searchQuery string) error {
-	rootNode := tree.GetRoot()
-	if rootNode == nil {
-		rootNode = tview.NewTreeNode("Namespaces").SetColor(tcell.ColorGreen)
-		tree.SetRoot(rootNode)
+
+	// Check if clients are ready
+	select {
+	case <-k8sClientsReady:
+		// Proceed
+	default:
+		// Clients not ready
+		return fmt.Errorf("Kubernetes clients are not initialized yet")
 	}
 
-	// Map existing namespace nodes for quick lookup
-	nsNodeMap := make(map[string]*tview.TreeNode)
-	for _, nsNode := range rootNode.GetChildren() {
-		nsNodeMap[nsNode.GetText()] = nsNode
+	rootNode := tview.NewTreeNode("Namespaces").SetColor(tcell.ColorGreen)
+
+	// Record expansion states before rebuilding the tree
+	existingRoot := tree.GetRoot()
+	if existingRoot != nil {
+		recordExpansionState(existingRoot)
 	}
 
-	var namespaceList *v1.NamespaceList
-	var err error
+	// Variables to store the selected pod's namespace and name
+	var previouslySelectedPodNamespace, previouslySelectedPodName string
+
+	// Capture the selected pod before rebuilding the tree
+	currentNode := tree.GetCurrentNode()
+	if currentNode != nil {
+		if podMeta, ok := currentNode.GetReference().(*metav1.PartialObjectMetadata); ok {
+			previouslySelectedPodNamespace = podMeta.Namespace
+			previouslySelectedPodName = podMeta.Name
+		}
+	}
+
+	// Build a map of namespaces with pods
+	namespacesWithPods := make(map[string][]metav1.PartialObjectMetadata)
 
 	if selectedNamespace == "all" {
-		namespaceList, err = clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			return err
-		}
-	} else {
-		namespaceList = &v1.NamespaceList{
-			Items: []v1.Namespace{
-				{ObjectMeta: metav1.ObjectMeta{Name: selectedNamespace}},
-			},
-		}
-	}
-
-	// Keep track of namespaces that exist in the latest data
-	existingNamespaces := make(map[string]bool)
-
-	for _, ns := range namespaceList.Items {
-		nsName := ns.Name
-		existingNamespaces[nsName] = true
-
-		nsNode, exists := nsNodeMap[nsName]
-		if !exists {
-			// Namespace node doesn't exist, create it
-			nsNode = tview.NewTreeNode(nsName).SetColor(tcell.ColorYellow)
-			rootNode.AddChild(nsNode)
-			nsNodeMap[nsName] = nsNode
-		}
-
-		// Map existing pod nodes
-		podNodeMap := make(map[string]*tview.TreeNode)
-		for _, podNode := range nsNode.GetChildren() {
-			podNodeMap[podNode.GetText()] = podNode
-		}
-
-		pods, err := clientset.CoreV1().Pods(nsName).List(context.TODO(), metav1.ListOptions{})
+		// Fetch the list of namespaces
+		namespaceList, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			return err
 		}
 
-		// Keep track of pods that exist in the latest data
-		existingPods := make(map[string]bool)
+		// Fetch pods from each namespace sequentially
+		for _, ns := range namespaceList.Items {
+			nsName := ns.Name
 
-		for _, pod := range pods.Items {
-			podName := pod.Name
-
-			if !strings.Contains(strings.ToLower(podName), strings.ToLower(searchQuery)) {
+			podList, err := dynamicClient.Resource(schema.GroupVersionResource{
+				Group:    "",
+				Version:  "v1",
+				Resource: "pods",
+			}).Namespace(nsName).List(context.TODO(), metav1.ListOptions{
+				// Specify that we want PartialObjectMetadata
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "PartialObjectMetadataList",
+					APIVersion: "meta.k8s.io/v1",
+				},
+			})
+			if err != nil {
+				// Handle the error gracefully, e.g., log and continue
+				log.Printf("Error fetching pods in namespace %s: %v", nsName, err)
 				continue
 			}
 
-			existingPods[podName] = true
+			// Convert the UnstructuredList to PartialObjectMetadataList
+			var metadataList metav1.PartialObjectMetadataList
+			err = runtime.DefaultUnstructuredConverter.FromUnstructured(podList.UnstructuredContent(), &metadataList)
+			if err != nil {
+				log.Printf("Error converting pods in namespace %s: %v", nsName, err)
+				continue
+			}
 
-			podNode, exists := podNodeMap[podName]
-			if !exists {
-				// Pod node doesn't exist, create it
-				podNode = tview.NewTreeNode(podName).SetReference(pod).SetColor(tcell.ColorWhite)
-				nsNode.AddChild(podNode)
-				podNodeMap[podName] = podNode
-			} else {
-				// Update the pod reference in case it has changed
-				podNode.SetReference(pod)
+			if len(metadataList.Items) > 0 {
+				namespacesWithPods[nsName] = metadataList.Items
 			}
 		}
-
-		// Remove pod nodes that no longer exist
-		newPodChildren := make([]*tview.TreeNode, 0)
-		for podName, podNode := range podNodeMap {
-			if existingPods[podName] {
-				newPodChildren = append(newPodChildren, podNode)
-			}
-		}
-
-		// If no pods are found, display a message node
-		if len(newPodChildren) == 0 {
-			nsNode.ClearChildren()
-			nsNode.AddChild(tview.NewTreeNode("No pods found").SetColor(tcell.ColorRed))
-		} else {
-			nsNode.ClearChildren()
-			nsNode.SetChildren(newPodChildren)
-		}
-	}
-
-	// Remove namespace nodes that no longer exist
-	newNsChildren := make([]*tview.TreeNode, 0)
-	for nsName, nsNode := range nsNodeMap {
-		if existingNamespaces[nsName] && len(nsNode.GetChildren()) > 0 {
-			newNsChildren = append(newNsChildren, nsNode)
-		}
-	}
-
-	// If no namespaces or pods are found, display a message node
-	if len(newNsChildren) == 0 {
-		rootNode.ClearChildren()
-		rootNode.AddChild(tview.NewTreeNode("No namespaces or pods found").SetColor(tcell.ColorRed))
 	} else {
-		rootNode.ClearChildren()
-		rootNode.SetChildren(newNsChildren)
+		// Fetch pods from the selected namespace
+		podList, err := dynamicClient.Resource(schema.GroupVersionResource{
+			Group:    "",
+			Version:  "v1",
+			Resource: "pods",
+		}).Namespace(selectedNamespace).List(context.TODO(), metav1.ListOptions{
+			// Specify that we want PartialObjectMetadata
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "PartialObjectMetadataList",
+				APIVersion: "meta.k8s.io/v1",
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		// Convert the UnstructuredList to PartialObjectMetadataList
+		var metadataList metav1.PartialObjectMetadataList
+		err = runtime.DefaultUnstructuredConverter.FromUnstructured(podList.UnstructuredContent(), &metadataList)
+		if err != nil {
+			return err
+		}
+
+		if len(metadataList.Items) > 0 {
+			namespacesWithPods[selectedNamespace] = metadataList.Items
+		}
+	}
+
+	// If a search query is provided, filter the pods
+	if searchQuery != "" {
+		for nsName, podList := range namespacesWithPods {
+			var matchingPods []metav1.PartialObjectMetadata
+			for _, podMeta := range podList {
+				if strings.Contains(strings.ToLower(podMeta.Name), strings.ToLower(searchQuery)) {
+					matchingPods = append(matchingPods, podMeta)
+				}
+			}
+			if len(matchingPods) > 0 {
+				namespacesWithPods[nsName] = matchingPods
+			} else {
+				delete(namespacesWithPods, nsName)
+			}
+		}
+	}
+
+	// Collect and sort the namespace names
+	var namespaceNames []string
+	for nsName := range namespacesWithPods {
+		namespaceNames = append(namespaceNames, nsName)
+	}
+	sort.Strings(namespaceNames)
+
+	// Build the tree view nodes
+	for _, nsName := range namespaceNames {
+		podList := namespacesWithPods[nsName]
+		nsNode := tview.NewTreeNode(nsName).SetColor(tcell.ColorYellow)
+
+		// Set expansion state based on previous state
+		if expanded, exists := namespaceExpansionState[nsName]; exists {
+			nsNode.SetExpanded(expanded)
+		} else {
+			nsNode.SetExpanded(false) // Default to collapsed if no previous state
+		}
+
+		// Correctly capture nsName in the closure
+		nsNameCopy := nsName
+
+		// Set the function to expand/collapse the namespace node when selected
+		nsNode.SetSelectedFunc(func(node *tview.TreeNode) func() {
+			return func() {
+				if node.IsExpanded() {
+					node.SetExpanded(false)
+					namespaceExpansionState[nsNameCopy] = false
+				} else {
+					node.SetExpanded(true)
+					namespaceExpansionState[nsNameCopy] = true
+				}
+			}
+		}(nsNode))
+
+		// Create a "Pods" node under the namespace
+		podsNode := tview.NewTreeNode("Pods").SetColor(tcell.ColorWhite)
+		podsNode.SetExpanded(true) // Expand the "Pods" node by default
+
+		// Add pods to the "Pods" node
+		for _, podMeta := range podList {
+			// Capture podMeta for closure
+			podMetaCopy := podMeta
+			podNode := tview.NewTreeNode(podMeta.Name).SetReference(&podMetaCopy).SetColor(tcell.ColorWhite)
+
+			// Set the selected function for the pod node
+			podNode.SetSelectedFunc(func() {
+				// Set the current node to the selected pod node
+				tree.SetCurrentNode(podNode)
+				// Handle pod selection to update isPodHighlighted and UI
+				handlePodSelection(podNode)
+			})
+
+			podsNode.AddChild(podNode)
+		}
+
+		// Add the "Pods" node under the namespace node
+		nsNode.AddChild(podsNode)
+
+		rootNode.AddChild(nsNode)
+	}
+
+	// If no namespaces with pods are found
+	if len(rootNode.GetChildren()) == 0 {
+		rootNode.AddChild(tview.NewTreeNode("No matching pods found").SetColor(tcell.ColorRed))
+	}
+
+	// Update the tree view
+	tree.SetRoot(rootNode)
+	tree.SetCurrentNode(rootNode)
+
+	// Function to recursively find and return the pod node, its parent (Pods node), and the namespace node
+	var findPodNode func(node *tview.TreeNode, namespace, podName string) (*tview.TreeNode, *tview.TreeNode, *tview.TreeNode)
+	findPodNode = func(node *tview.TreeNode, namespace, podName string) (*tview.TreeNode, *tview.TreeNode, *tview.TreeNode) {
+		if node.GetText() == namespace {
+			// This is the namespace node
+			for _, child := range node.GetChildren() {
+				if child.GetText() == "Pods" {
+					podsNode := child
+					for _, podNode := range podsNode.GetChildren() {
+						if podMeta, ok := podNode.GetReference().(*metav1.PartialObjectMetadata); ok {
+							if podMeta.Namespace == namespace && podMeta.Name == podName {
+								return podNode, podsNode, node // Return podNode, podsNode, namespaceNode
+							}
+						}
+					}
+				}
+			}
+		} else {
+			for _, child := range node.GetChildren() {
+				foundNode, podsNode, namespaceNode := findPodNode(child, namespace, podName)
+				if foundNode != nil {
+					return foundNode, podsNode, namespaceNode
+				}
+			}
+		}
+		return nil, nil, nil
+	}
+
+	// After rebuilding the tree, attempt to re-select the previously selected pod
+	if previouslySelectedPodName != "" && previouslySelectedPodNamespace != "" {
+		// Find the pod node in the new tree
+		podNode, podsNode, namespaceNode := findPodNode(rootNode, previouslySelectedPodNamespace, previouslySelectedPodName)
+		if podNode != nil {
+			// Expand the Pods node
+			if podsNode != nil {
+				podsNode.SetExpanded(true)
+			}
+			// Expand the namespace node
+			if namespaceNode != nil {
+				namespaceNode.SetExpanded(true)
+			}
+			// Set the current node to the pod node
+			tree.SetCurrentNode(podNode)
+		} else {
+			// Pod no longer exists; reset selection to root
+			tree.SetCurrentNode(rootNode)
+		}
 	}
 
 	return nil
+}
+
+// Function to handle pod selection and update the UI
+func handlePodSelection(node *tview.TreeNode) {
+	if podMeta, ok := node.GetReference().(*metav1.PartialObjectMetadata); ok {
+		isPodHighlighted = true
+		secondSection.SetText(fmt.Sprintf("Highlighted Pod: %s. Use the menu at the top to interact", podMeta.Name))
+	} else {
+		isPodHighlighted = false
+	}
 }
 
 // Function to highlight the currently focused view by changing its border color
 func setFocusHighlight(focusedView tview.Primitive) {
 	app.SetFocus(focusedView)
 	// Reset all borders to white
-	treeView.SetBorderColor(tcell.ColorWhite)
-	secondSection.SetBorderColor(tcell.ColorWhite)
-	searchInput.SetBorderColor(tcell.ColorWhite)
-	namespaceDropdown.SetBorderColor(tcell.ColorWhite)
+	if treeView != nil {
+		treeView.SetBorderColor(tcell.ColorWhite)
+	}
+	if secondSection != nil {
+		secondSection.SetBorderColor(tcell.ColorWhite)
+	}
+	if searchInput != nil {
+		searchInput.SetBorderColor(tcell.ColorWhite)
+	}
+	if namespaceDropdown != nil {
+		namespaceDropdown.SetBorderColor(tcell.ColorWhite)
+	}
 
 	// Set the border color of the focused view to blue
 	switch focusedView.(type) {
 	case *tview.TreeView:
-		treeView.SetBorderColor(tcell.ColorBlue)
+		if treeView != nil {
+			treeView.SetBorderColor(tcell.ColorBlue)
+		}
 	case *tview.TextView:
-		secondSection.SetBorderColor(tcell.ColorBlue)
+		if secondSection != nil {
+			secondSection.SetBorderColor(tcell.ColorBlue)
+		}
 	case *tview.InputField:
-		searchInput.SetBorderColor(tcell.ColorBlue)
+		if searchInput != nil {
+			searchInput.SetBorderColor(tcell.ColorBlue)
+		}
 	case *tview.DropDown:
-		namespaceDropdown.SetBorderColor(tcell.ColorBlue)
+		if namespaceDropdown != nil {
+			namespaceDropdown.SetBorderColor(tcell.ColorBlue)
+		}
 	}
 }
 
 // Function to update the helper text with the last refresh timestamp
 func updateHelperText(helperText *tview.TextView) {
-	helperText.SetText(fmt.Sprintf("[::b]Podminator[::d]\n [yellow]'o'[-] Toggle Terminals | [yellow]'l'[-] Logs | [yellow]'t'[-] Tail Logs | [yellow]'e'[-] Exec | [yellow]'E'[-] (SHIFT+e) Exec with custom command | [yellow]'i'[-] Info | [yellow]'y'[-] YAML | [yellow]'n'[-] Namespace | [yellow]'s'[-] Search |  [yellow]'spacebar'[-] Jump to bottom (Pod output) | [yellow]'q'[-] Quit \nPods are refreshed every 30 seconds - last timestamp: [yellow]%s[-]", lastRefreshed)).
+	helperText.SetText(fmt.Sprintf("[::b]Podminator[::d]\n [yellow]'o'[-] Toggle Terminals | [yellow]'l'[-] Logs | [yellow]'t'[-] Tail Logs | [yellow]'e'[-] Exec | [yellow]'E'[-] (SHIFT+e) Exec with custom command | [yellow]'i'[-] Info | [yellow]'y'[-] YAML | [yellow]'n'[-] Namespace | [yellow]'s'[-] Search | [yellow]'r'[-] Refresh | [yellow]'spacebar'[-] Jump to bottom (Pod output) | [yellow]'q'[-] Quit \nPods are refreshed every 60 seconds - last timestamp: [yellow]%s[-]", lastRefreshed)).
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
 }
 
-func periodicPodRefresh(clientset *kubernetes.Clientset, app *tview.Application, treeView *tview.TreeView, helperText *tview.TextView, selectedNamespace string, searchQuery string) {
-	// Create a ticker to trigger the refresh every 30 seconds
-	ticker := time.NewTicker(30 * time.Second)
+// Function to periodically refresh the pod list
+func periodicPodRefresh(clientset *kubernetes.Clientset, app *tview.Application, treeView *tview.TreeView, helperText *tview.TextView, searchInput *tview.InputField) {
+	// Create a ticker to trigger the refresh every 60 seconds
+	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
+			// Check if clients are ready
+			select {
+			case <-k8sClientsReady:
+				// Proceed
+			default:
+				// Clients not ready, skip this iteration
+				continue
+			}
+
 			// Fetch data in a separate goroutine
 			go func() {
+				var selectedNamespaceLocal string
+				// Access UI elements within app.QueueUpdateDraw
+				app.QueueUpdateDraw(func() {
+					selectedOption, _ := namespaceDropdown.GetCurrentOption()
+					selectedNamespaceLocal = namespaceOptions[selectedOption]
+				})
+				if selectedNamespaceLocal == "Select a namespace" {
+					// Do not refresh if no namespace is selected
+					return
+				}
+				searchQuery := searchInput.GetText()
+
 				// Fetch data from Kubernetes API
-				err := updatePodTreeView(clientset, selectedNamespace, treeView, app, searchQuery)
+				err := updatePodTreeView(clientset, selectedNamespaceLocal, treeView, app, searchQuery)
 				if err != nil {
 					log.Printf("Error updating tree view: %v", err)
 					return
@@ -361,7 +571,69 @@ func periodicPodRefresh(clientset *kubernetes.Clientset, app *tview.Application,
 	}
 }
 
+func loadNamespaces() {
+	mu.Lock()
+	cs := clientset
+	mu.Unlock()
+
+	// Load the namespaces
+	namespaceList, err := cs.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		log.Printf("Error retrieving namespaces: %v", err)
+		return
+	}
+
+	// Collect and sort the namespace names
+	var namespaceNames []string
+	for _, ns := range namespaceList.Items {
+		namespaceNames = append(namespaceNames, ns.Name)
+	}
+	sort.Strings(namespaceNames)
+
+	// Build the new namespace options
+	newNamespaceOptions := append([]string{"Select a namespace", "all"}, namespaceNames...)
+
+	// Update the UI in the main thread
+	app.QueueUpdateDraw(func() {
+		namespaceOptions = newNamespaceOptions
+		// Update the dropdown options and enable it
+		namespaceDropdown.SetOptions(namespaceOptions, namespaceSelectHandler)
+		// Set the current option to "Select a namespace"
+		namespaceDropdown.SetCurrentOption(0)
+		// Enable the dropdown
+		namespaceDropdown.SetDisabled(false)
+	})
+}
+
+func namespaceSelectHandler(option string, index int) {
+	selectedNamespace = option
+	// Clear the search input when namespace changes
+	searchInput.SetText("")
+	if selectedNamespace == "Select a namespace" {
+		// Clear the tree view
+		rootNode := tview.NewTreeNode("Please select a namespace to load pods").SetColor(tcell.ColorYellow)
+		treeView.SetRoot(rootNode).SetCurrentNode(rootNode)
+		secondSection.SetText("Output will be displayed here")
+	} else {
+		// Update the tree view when a new namespace is selected
+		err := updatePodTreeView(clientset, selectedNamespace, treeView, app, "")
+		if err != nil {
+			log.Printf("Error updating tree view: %v", err)
+		}
+		treeView.SetCurrentNode(treeView.GetRoot()) // Reset focus to root
+		setFocusHighlight(treeView)
+		if selectedNamespace == "all" {
+			secondSection.SetText("[red]Warning:[-] Displaying all namespaces may affect performance.")
+		} else {
+			secondSection.SetText("Output will be displayed here")
+		}
+	}
+}
+
 func main() {
+	// Initialize the application
+	app = tview.NewApplication()
+
 	// Set up Kubernetes client configuration
 	var kubeconfig *string
 	if home := homedir.HomeDir(); home != "" {
@@ -374,43 +646,97 @@ func main() {
 	flag.StringVar(&namespace, "namespace", "", "(optional) namespace to list pods. If empty, all namespaces are considered.")
 	flag.Parse()
 
-	// Build Kubernetes clientset
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
-	if err != nil {
-		log.Fatalf("Error building kubeconfig: %v", err)
-	}
+	go func() {
+		// Build Kubernetes clientset
+		config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+		if err != nil {
+			log.Printf("Error building kubeconfig: %v", err)
+			return
+		}
 
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("Error creating Kubernetes client: %v", err)
-	}
+		cs, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			log.Printf("Error creating Kubernetes client: %v", err)
+			return
+		}
+
+		// Initialize the dynamic client
+		dc, err := dynamic.NewForConfig(config)
+		if err != nil {
+			log.Printf("Error creating dynamic client: %v", err)
+			return
+		}
+
+		// Update the global variables safely
+		mu.Lock()
+		clientset = cs
+		dynamicClient = dc
+		mu.Unlock()
+
+		// Now that clients are initialized, load namespaces
+		loadNamespaces()
+
+		// Signal that clients are ready
+		close(k8sClientsReady)
+	}()
+	// // Build Kubernetes clientset
+	// config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	// if err != nil {
+	// 	log.Fatalf("Error building kubeconfig: %v", err)
+	// }
+
+	// clientset, err = kubernetes.NewForConfig(config)
+	// if err != nil {
+	// 	log.Fatalf("Error creating Kubernetes client: %v", err)
+	// }
+
+	// // Initialize the dynamic client
+	// dynamicClient, err = dynamic.NewForConfig(config)
+	// if err != nil {
+	// 	log.Fatalf("Error creating dynamic client: %v", err)
+	// }
 
 	// Retrieve the list of namespaces
-	namespaceList, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		log.Fatalf("Error retrieving namespaces: %v", err)
-	}
+	// namespaceList, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	// if err != nil {
+	// 	log.Fatalf("Error retrieving namespaces: %v", err)
+	// }
 
-	// Populate the namespace dropdown
-	namespaceOptions = append(namespaceOptions, "all")
-	for _, ns := range namespaceList.Items {
-		namespaceOptions = append(namespaceOptions, ns.Name)
-	}
+	// // Collect and sort the namespace names
+	// var namespaceNames []string
+	// for _, ns := range namespaceList.Items {
+	// 	namespaceNames = append(namespaceNames, ns.Name)
+	// }
+	// sort.Strings(namespaceNames)
+
+	// Populate the namespace dropdown with "all" at the top
+	// Populate the namespace dropdown with "Select a namespace" at the top
+	// namespaceOptions = append([]string{"Select a namespace", "all"}, namespaceNames...)
+
+	// Sort the namespace options alphabetically
+	// sort.Strings(namespaceOptions)
 
 	// Initialize the lastRefreshed variable with the current timestamp
 	lastRefreshed = time.Now().Format("15:04:05")
 
+	// Initialize treeView before setting up namespaceDropdown
+	treeView = tview.NewTreeView()
+	treeView.SetBorder(true).SetTitle("Namespaces and Pods")
+
+	// Initialize modal
+	modal = tview.NewModal()
+
 	// Helper text at the top of the UI
-	helperText := tview.NewTextView()
+	helperText = tview.NewTextView()
 	updateHelperText(helperText)
 
 	// Search input for filtering the pod list
-	searchInput.
+	searchInput = tview.NewInputField().
 		SetLabel("Search: ").
 		SetFieldWidth(30)
 
 	// Output section to display command output (logs, describe, etc.)
-	secondSection.
+	secondSection = tview.NewTextView().
 		SetTextAlign(tview.AlignLeft).
 		SetScrollable(true).
 		SetText("Output will be displayed here")
@@ -423,156 +749,172 @@ func main() {
 				secondSection.ScrollToEnd() // Scroll to the bottom
 				return nil
 			}
+		case tcell.KeyLeft:
+			setFocusHighlight(treeView)
+			return nil
 		}
 		return event
 	})
 
-	// Dropdown for selecting namespaces
-	namespaceDropdown.
-		SetLabel("Namespace: ").
+	// namespaceDropdown = tview.NewDropDown()
+	// Now set its properties
+	// Initialize the namespaceDropdown
+	// namespaceDropdown.SetLabel("Namespace: ").
+	// 	SetOptions(namespaceOptions, func(option string, index int) {
+	// 		selectedNamespace = option
+	// 		// Clear the search input when namespace changes
+	// 		searchInput.SetText("")
+	// 		if selectedNamespace == "Select a namespace" {
+	// 			// Clear the tree view
+	// 			rootNode := tview.NewTreeNode("Please select a namespace to load pods").SetColor(tcell.ColorYellow)
+	// 			treeView.SetRoot(rootNode).SetCurrentNode(rootNode)
+	// 			secondSection.SetText("Output will be displayed here")
+	// 		} else {
+	// 			// Update the tree view when a new namespace is selected
+	// 			err := updatePodTreeView(clientset, selectedNamespace, treeView, app, "")
+	// 			if err != nil {
+	// 				log.Printf("Error updating tree view: %v", err)
+	// 			}
+	// 			treeView.SetCurrentNode(treeView.GetRoot()) // Reset focus to root
+	// 			setFocusHighlight(treeView)
+	// 			if selectedNamespace == "all" {
+	// 				secondSection.SetText("[red]Warning:[-] Displaying all namespaces may affect performance.")
+	// 			} else {
+	// 				secondSection.SetText("Output will be displayed here")
+	// 			}
+	// 		}
+	// 	})
+
+	// Now that namespaceDropdown is fully initialized, set the current option
+	// namespaceDropdown.SetCurrentOption(0)
+
+	// Initialize namespaceOptions with "Loading namespaces"
+	namespaceOptions = []string{"Loading namespaces"}
+
+	// Initialize the namespaceDropdown
+	namespaceDropdown = tview.NewDropDown()
+	namespaceDropdown.SetLabel("Namespace: ").
 		SetOptions(namespaceOptions, func(option string, index int) {
-			selectedNamespace = option
-			// Clear the search input when namespace changes
-			searchInput.SetText("")
-			// Update the tree view when a new namespace is selected
-			err := updatePodTreeView(clientset, selectedNamespace, treeView, app, "")
-			if err != nil {
-				log.Printf("Error updating tree view: %v", err)
-			}
-			treeView.SetCurrentNode(treeView.GetRoot()) // Reset focus to root
-			setFocusHighlight(treeView)
+			// The dropdown is disabled, so this won't be called yet
 		}).
-		SetCurrentOption(0)
+		SetDisabled(true)
+
+		// Start a goroutine to load namespaces
+	// go func() {
+	// 	// Load the namespaces
+	// 	namespaceList, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+	// 	if err != nil {
+	// 		log.Printf("Error retrieving namespaces: %v", err)
+	// 		return
+	// 	}
+
+	// 	// Collect and sort the namespace names
+	// 	var namespaceNames []string
+	// 	for _, ns := range namespaceList.Items {
+	// 		namespaceNames = append(namespaceNames, ns.Name)
+	// 	}
+	// 	sort.Strings(namespaceNames)
+
+	// 	// Build the new namespace options
+	// 	newNamespaceOptions := append([]string{"Select a namespace", "all"}, namespaceNames...)
+
+	// 	// Update the UI in the main thread
+	// 	app.QueueUpdateDraw(func() {
+	// 		namespaceOptions = newNamespaceOptions
+	// 		// Update the dropdown options and enable it
+	// 		namespaceDropdown.SetOptions(namespaceOptions, func(option string, index int) {
+	// 			selectedNamespace = option
+	// 			// Clear the search input when namespace changes
+	// 			searchInput.SetText("")
+	// 			if selectedNamespace == "Select a namespace" {
+	// 				// Clear the tree view
+	// 				rootNode := tview.NewTreeNode("Please select a namespace to load pods").SetColor(tcell.ColorYellow)
+	// 				treeView.SetRoot(rootNode).SetCurrentNode(rootNode)
+	// 				secondSection.SetText("Output will be displayed here")
+	// 			} else {
+	// 				// Update the tree view when a new namespace is selected
+	// 				err := updatePodTreeView(clientset, selectedNamespace, treeView, app, "")
+	// 				if err != nil {
+	// 					log.Printf("Error updating tree view: %v", err)
+	// 				}
+	// 				treeView.SetCurrentNode(treeView.GetRoot()) // Reset focus to root
+	// 				setFocusHighlight(treeView)
+	// 				if selectedNamespace == "all" {
+	// 					secondSection.SetText("[red]Warning:[-] Displaying all namespaces may affect performance.")
+	// 				} else {
+	// 					secondSection.SetText("Output will be displayed here")
+	// 				}
+	// 			}
+	// 		})
+	// 		// Set the current option to "Select a namespace"
+	// 		namespaceDropdown.SetCurrentOption(0)
+	// 		// Enable the dropdown
+	// 		namespaceDropdown.SetDisabled(false)
+	// 	})
+	// }()
 
 	// Create the grid layout for the UI
-	grid := tview.NewGrid().
-		SetRows(3, 1, 0).
+	grid = tview.NewGrid().
+		SetRows(4, 1, 0).
 		SetColumns(0, 0).
 		SetBorders(true).
 		AddItem(helperText, 0, 0, 1, 2, 0, 0, false).
 		AddItem(searchInput, 1, 0, 1, 1, 0, 0, false).
-		AddItem(namespaceDropdown, 1, 1, 1, 1, 0, 0, false).
-		AddItem(treeView, 2, 0, 1, 1, 0, 0, true).
+		AddItem(namespaceDropdown, 1, 1, 1, 1, 0, 0, false)
+
+	// Initialize the tree view
+	// err = updatePodTreeView(clientset, selectedNamespace, treeView, app, "")
+	// if err != nil {
+	// 	log.Fatalf("Error updating tree view: %v", err)
+	// }
+	rootNode := tview.NewTreeNode("Please select a namespace to load pods").SetColor(tcell.ColorYellow)
+	treeView.SetRoot(rootNode).SetCurrentNode(rootNode)
+
+	// Add the tree view and second section to the grid
+	grid.AddItem(treeView, 2, 0, 1, 1, 0, 0, true).
 		AddItem(secondSection, 2, 1, 1, 1, 0, 0, false)
 
-	// Set up the tree view
-	treeView.
-		SetBorder(true).
-		SetTitle("Namespaces and Pods")
+	// Debounce the search input changes
+	debouncedUpdate := debounce(func() {
+		app.QueueUpdateDraw(func() {
+			err := updatePodTreeView(clientset, selectedNamespace, treeView, app, searchInput.GetText())
+			if err != nil {
+				log.Printf("Error updating tree view: %v", err)
+			}
+		})
+	}, 300*time.Millisecond)
 
-	// Update the tree view initially
-	err = updatePodTreeView(clientset, selectedNamespace, treeView, app, "")
-	if err != nil {
-		log.Fatalf("Error updating tree view: %v", err)
-	}
+	// Update the tree view when search input changes
+	searchInput.SetChangedFunc(func(text string) {
+		debouncedUpdate()
+	})
 
-	// Set input capture for key events in the search input field
+	// Modify the SetDoneFunc for search input
 	searchInput.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
-			// Move focus back to the tree view when Enter is pressed
+			// Update the tree view when Enter is pressed
+			err := updatePodTreeView(clientset, selectedNamespace, treeView, app, searchInput.GetText())
+			if err != nil {
+				log.Printf("Error updating tree view: %v", err)
+			}
+			// Move focus back to the tree view
 			setFocusHighlight(treeView)
 		}
 	})
 
-	// Update the tree view when search input changes
-	searchInput.SetChangedFunc(func(text string) {
-		err := updatePodTreeView(clientset, selectedNamespace, treeView, app, text)
-		if err != nil {
-			log.Printf("Error updating tree view: %v", err)
-		}
+	treeView.SetChangedFunc(func(node *tview.TreeNode) {
+		handlePodSelection(node)
 	})
 
-	// Handle key events for tree view interactions (logs, exec, etc.)
 	treeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		currentNode := treeView.GetCurrentNode()
-		if currentNode == nil {
-			return event
-		}
-		// Check if the current node is a pod node
-		pod, ok := currentNode.GetReference().(v1.Pod)
-		if !ok {
-			// If it's not a pod node, navigate into the node
-			if event.Key() == tcell.KeyEnter || event.Key() == tcell.KeyRight {
-				currentNode.SetExpanded(true)
-				if len(currentNode.GetChildren()) > 0 {
-					treeView.SetCurrentNode(currentNode.GetChildren()[0])
-				}
-				return nil
-			} else if event.Key() == tcell.KeyLeft {
-				if currentNode.IsExpanded() {
-					currentNode.SetExpanded(false)
-				}
-				return nil
-			}
-			return event
-		}
-		podName := pod.Name
-		podNamespace := pod.Namespace
-		containers := pod.Spec.Containers
-
-		// Key bindings for different actions (logs, exec, yaml, etc.)
-		switch event.Rune() {
-		case 'y', 'Y':
-			runYamlCommand(podName, podNamespace, secondSection)
-			setFocusHighlight(secondSection)
-			return nil
-		case 'i', 'I':
-			runDescribeCommand(podName, podNamespace, secondSection)
-			setFocusHighlight(secondSection)
-			return nil
-		case 'l', 'L':
-			if len(containers) > 1 {
-				showContainerSelectionModal(app, podName, containers, func(containerName string) {
-					runLogsCommand(podName, podNamespace, containerName, secondSection)
-					setFocusHighlight(secondSection)
-				}, grid)
-			} else {
-				runLogsCommand(podName, podNamespace, containers[0].Name, secondSection)
-				setFocusHighlight(secondSection)
-			}
-			return nil
-		case 't', 'T':
-			if len(containers) > 1 {
-				showContainerSelectionModal(app, podName, containers, func(containerName string) {
-					runTailLogsInTerminal(podName, podNamespace, containerName)
-				}, grid)
-			} else {
-				runTailLogsInTerminal(podName, podNamespace, containers[0].Name)
-			}
-			return nil
-		case 'e':
-			if len(containers) > 1 {
-				showContainerSelectionModal(app, podName, containers, func(containerName string) {
-					runExecInTerminal(podName, podNamespace, containerName, "/bin/sh")
-				}, grid)
-			} else {
-				runExecInTerminal(podName, podNamespace, containers[0].Name, "/bin/sh")
-			}
-			return nil
-		case 'E':
-			if len(containers) > 1 {
-				showContainerSelectionModal(app, podName, containers, func(containerName string) {
-					showExecCommandModal(app, podName, podNamespace, containerName, grid)
-				}, grid)
-			} else {
-				showExecCommandModal(app, podName, podNamespace, containers[0].Name, grid)
-			}
-			return nil
-		}
-
-		// Navigation keys for pod nodes
 		switch event.Key() {
-		case tcell.KeyRight, tcell.KeyEnter:
-			// Do nothing for pod nodes
-			return nil
-		case tcell.KeyLeft:
-			// Collapse the namespace node if possible
-			if currentNode.IsExpanded() {
-				currentNode.SetExpanded(false)
-			}
+		// Allow treeView to handle navigation keys
+		case tcell.KeyUp, tcell.KeyDown, tcell.KeyLeft, tcell.KeyRight, tcell.KeyEnter:
+			return event
+		default:
+			// For other keys, return nil to prevent treeView from handling them
 			return nil
 		}
-		return event
 	})
 
 	// Global input handling for arrow navigation and terminal toggling
@@ -604,8 +946,114 @@ func main() {
 		case 's', 'S':
 			setFocusHighlight(searchInput)
 			return nil
+		case 'r', 'R':
+			// Check if clients are ready
+			select {
+			case <-k8sClientsReady:
+				// Proceed
+			default:
+				// Clients not ready
+				secondSection.SetText("Kubernetes clients are not initialized yet.")
+				return nil
+			}
+			// Manual refresh
+			go func() {
+				err := updatePodTreeView(clientset, selectedNamespace, treeView, app, searchInput.GetText())
+				if err != nil {
+					log.Printf("Error updating tree view: %v", err)
+				}
+				lastRefreshed = time.Now().Format("15:04:05")
+				app.QueueUpdateDraw(func() {
+					updateHelperText(helperText)
+				})
+			}()
+			return nil
 		case 'q', 'Q':
 			app.Stop()
+		}
+
+		// If a pod is highlighted, handle pod-specific key bindings
+		if isPodHighlighted {
+			// Check if clients are ready
+			select {
+			case <-k8sClientsReady:
+				// Proceed
+			default:
+				// Clients not ready
+				secondSection.SetText("Kubernetes clients are not initialized yet.")
+				return nil
+			}
+			// Get the currently highlighted node
+			currentNode := treeView.GetCurrentNode()
+			if currentNode != nil {
+				if podMeta, ok := currentNode.GetReference().(*metav1.PartialObjectMetadata); ok {
+					podName := podMeta.Name
+					podNamespace := podMeta.Namespace
+
+					// Fetch the full pod object
+					pod, err := clientset.CoreV1().Pods(podNamespace).Get(context.TODO(), podName, metav1.GetOptions{})
+					if err != nil {
+						secondSection.SetText(fmt.Sprintf("Error fetching pod details: %v", err))
+						return nil
+					}
+					containers := pod.Spec.Containers
+
+					// Pod-specific key bindings
+					switch event.Rune() {
+					case 'y', 'Y':
+						runYamlCommand(podName, podNamespace, secondSection)
+						setFocusHighlight(secondSection)
+						return nil
+					case 'i', 'I':
+						runDescribeCommand(podName, podNamespace, secondSection)
+						setFocusHighlight(secondSection)
+						return nil
+					case 'l', 'L':
+						if len(containers) > 1 {
+							showContainerSelectionModal(app, podName, containers, func(containerName string) {
+								runLogsCommand(podName, podNamespace, containerName, secondSection)
+								setFocusHighlight(secondSection)
+							}, grid)
+						} else {
+							runLogsCommand(podName, podNamespace, containers[0].Name, secondSection)
+							setFocusHighlight(secondSection)
+						}
+						return nil
+					case 't', 'T':
+						if len(containers) > 1 {
+							showContainerSelectionModal(app, podName, containers, func(containerName string) {
+								runTailLogsInTerminal(podName, podNamespace, containerName)
+							}, grid)
+						} else {
+							runTailLogsInTerminal(podName, podNamespace, containers[0].Name)
+						}
+						return nil
+					case 'e':
+						if len(containers) > 1 {
+							showContainerSelectionModal(app, podName, containers, func(containerName string) {
+								runExecInTerminal(podName, podNamespace, containerName, "/bin/sh")
+								modalActive = false
+								app.SetRoot(grid, true).SetFocus(treeView)
+								setFocusHighlight(treeView)
+							}, grid)
+						} else {
+							runExecInTerminal(podName, podNamespace, containers[0].Name, "/bin/sh")
+							app.SetFocus(treeView)
+							setFocusHighlight(treeView)
+						}
+						return nil
+					case 'E':
+						if len(containers) > 1 {
+							showContainerSelectionModal(app, podName, containers, func(containerName string) {
+								showExecCommandModal(app, podName, podNamespace, containerName, grid)
+							}, grid)
+						} else {
+							showExecCommandModal(app, podName, podNamespace, containers[0].Name, grid)
+						}
+						return nil
+					}
+				}
+			}
 		}
 
 		// Arrow key navigation between treeView and secondSection
@@ -621,7 +1069,7 @@ func main() {
 	})
 
 	// Launch the pod refresh function in the background
-	go periodicPodRefresh(clientset, app, treeView, helperText, selectedNamespace, searchInput.GetText())
+	go periodicPodRefresh(clientset, app, treeView, helperText, searchInput)
 
 	// Run the application
 	if err := app.SetRoot(grid, true).Run(); err != nil {
@@ -682,7 +1130,7 @@ func showExecCommandModal(app *tview.Application, podName string, podNamespace s
 		AddItem(
 			tview.NewFlex().SetDirection(tview.FlexColumn).
 				AddItem(nil, 0, 1, false).  // Add empty space to the left
-				AddItem(form, 40, 1, true). // Center form horizontally (fixed width of 60)
+				AddItem(form, 40, 1, true). // Center form horizontally (fixed width of 40)
 				AddItem(nil, 0, 1, false),  // Add empty space to the right
 						0, 1, true). // Increase vertical space to ensure input is visible
 		AddItem(nil, 0, 1, false) // Add empty space at the bottom (flexible)
