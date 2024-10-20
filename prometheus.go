@@ -3,10 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/guptarohit/asciigraph"
+	"github.com/NimbleMarkets/ntcharts/linechart/timeserieslinechart"
 	"github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
@@ -33,20 +32,21 @@ func (state *AppState) detectPrometheus() {
 	}
 }
 
+// prometheus.go
 func (state *AppState) getPrometheusMetrics(podName, podNamespace string) (cpuData []float64, memData []float64, err error) {
 	if !state.promDetected || state.promClient == nil {
 		err = fmt.Errorf("Prometheus is not detected or not accessible")
 		return
 	}
 
-	// Define the time range for the last hour
-	end := time.Now()                // Current time
-	start := end.Add(-1 * time.Hour) // One hour before the current time
-	step := time.Minute              // Fetch data every minute
+	// Define the time range for the last 8 hours
+	end := time.Now()
+	start := end.Add(-8 * time.Hour)
+	step := time.Minute * 15 // Data points
 
 	// PromQL queries
-	cpuQuery := fmt.Sprintf(`rate(container_cpu_usage_seconds_total{pod="%s",namespace="%s"}[5m])`, podName, podNamespace)
-	memQuery := fmt.Sprintf(`container_memory_usage_bytes{pod="%s",namespace="%s"}`, podName, podNamespace)
+	cpuQuery := fmt.Sprintf(`avg (rate (container_cpu_usage_seconds_total{pod="%s",namespace="%s"}[15m]))`, podName, podNamespace)
+	memQuery := fmt.Sprintf(`avg (rate (container_memory_usage_bytes{pod="%s",namespace="%s"}[15m]))`, podName, podNamespace)
 
 	// Query CPU metrics
 	cpuResult, warnings, err := state.promClient.QueryRange(context.TODO(), cpuQuery, promv1.Range{
@@ -67,9 +67,12 @@ func (state *AppState) getPrometheusMetrics(podName, podNamespace string) (cpuDa
 	}
 
 	// Process CPU data
+	cpuData = make([]float64, 0)
 	for _, stream := range cpuMatrix {
 		for _, val := range stream.Values {
-			cpuData = append(cpuData, float64(val.Value))
+			// cpuData = append(cpuData, float64(val.Value))
+			// Multiply CPU value by 1000 to convert to millicores
+			cpuData = append(cpuData, float64(val.Value)*1000)
 		}
 	}
 
@@ -92,6 +95,7 @@ func (state *AppState) getPrometheusMetrics(podName, podNamespace string) (cpuDa
 	}
 
 	// Process Memory data
+	memData = make([]float64, 0)
 	for _, stream := range memMatrix {
 		for _, val := range stream.Values {
 			// Convert bytes to megabytes
@@ -102,121 +106,66 @@ func (state *AppState) getPrometheusMetrics(podName, podNamespace string) (cpuDa
 	return
 }
 
-func plotMemoryGraph(data []float64, caption string) string {
-	if len(data) == 0 {
+func (state *AppState) plotCPUGraph(cpuData []float64, caption string) string {
+	if len(cpuData) == 0 {
 		return "No data available to plot."
 	}
 
-	// Find min and max values to scale the Y-axis
-	min, max := minMax(data)
-	yLabels := []string{}
+	// Increase the height for better Y-axis resolution
+	tslc := timeserieslinechart.New(80, 20) // Width: 80, Height: 20
 
-	// Determine the Y-axis step based on the height
-	height := 10 // same as the height used in asciigraph.Plot
-	step := (max - min) / float64(height)
+	endTime := time.Now()
+	step := time.Minute
+	startTime := endTime.Add(-time.Duration(len(cpuData)-1) * step)
 
-	// Generate formatted Y-axis labels
-	maxLabelWidth := 0
-	for i := 0; i <= height; i++ {
-		value := max - step*float64(i)
-		label := formatBytes(int64(value))
-		yLabels = append(yLabels, label)
-		if len(label) > maxLabelWidth {
-			maxLabelWidth = len(label)
-		}
+	tslc.XLabelFormatter = timeserieslinechart.HourTimeLabelFormatter()
+
+	for i, value := range cpuData {
+		timestamp := startTime.Add(time.Duration(i) * step)
+		tslc.Push(timeserieslinechart.TimePoint{
+			Time:  timestamp,
+			Value: value,
+		})
 	}
 
-	// Generate the graph without captions to simplify processing
-	graph := asciigraph.Plot(data, asciigraph.Height(height), asciigraph.Width(80))
+	tslc.DrawBraille()
 
-	// Split the graph into lines
-	lines := strings.Split(graph, "\n")
+	// Manually add the caption
+	result := fmt.Sprintf("%s\n%s", caption, tslc.View())
 
-	// Replace the Y-axis labels with formatted labels
-	for i, line := range lines {
-		if len(yLabels) > i {
-			idx := strings.Index(line, "|")
-			if idx != -1 {
-				// Right-align the label based on the maximum width
-				label := fmt.Sprintf("%*s", maxLabelWidth, yLabels[i])
-				lines[i] = label + " " + line[idx:]
-			}
-		}
-	}
-
-	// Add the caption at the top
-	lines = append([]string{caption}, lines...)
-
-	// Recombine the lines
-	return strings.Join(lines, "\n")
+	return result
 }
 
-func plotCPUGraph(data []float64, caption string) string {
-	if len(data) == 0 {
+func (state *AppState) plotMemoryGraph(memData []float64, caption string) string {
+	if len(memData) == 0 {
 		return "No data available to plot."
 	}
 
-	// Multiply CPU usage by 1000 to convert to millicores
-	for i := range data {
-		data[i] = data[i] * 1000
+	// Create a new TimeSeriesLineChart with the desired width and height
+	tslc := timeserieslinechart.New(80, 10) // Adjust width and height as needed
+
+	endTime := time.Now()
+	step := time.Minute
+	startTime := endTime.Add(-time.Duration(len(memData)-1) * step)
+
+	tslc.XLabelFormatter = timeserieslinechart.HourTimeLabelFormatter()
+
+	for i, value := range memData {
+		timestamp := startTime.Add(time.Duration(i) * step)
+		tslc.Push(timeserieslinechart.TimePoint{
+			Time:  timestamp,
+			Value: value,
+		})
 	}
 
-	// Find min and max values
-	min, max := minMax(data)
-	yLabels := []string{}
+	// Draw the chart using Braille characters (or use DrawASCII() if preferred)
+	tslc.DrawBraille()
 
-	// Determine the Y-axis step
-	height := 10
-	step := (max - min) / float64(height)
+	// Get the chart as a string
+	chartString := tslc.View()
 
-	// Generate formatted Y-axis labels
-	maxLabelWidth := 0
-	for i := 0; i <= height; i++ {
-		value := max - step*float64(i)
-		label := fmt.Sprintf("%.0f mC", value) // millicores
-		yLabels = append(yLabels, label)
-		if len(label) > maxLabelWidth {
-			maxLabelWidth = len(label)
-		}
-	}
+	// Combine the caption and the chart
+	result := fmt.Sprintf("%s\n%s", caption, chartString)
 
-	// Generate the graph
-	graph := asciigraph.Plot(data, asciigraph.Height(height), asciigraph.Width(80))
-
-	// Replace Y-axis labels
-	lines := strings.Split(graph, "\n")
-	for i, line := range lines {
-		if len(yLabels) > i {
-			idx := strings.Index(line, "|")
-			if idx != -1 {
-				label := fmt.Sprintf("%*s", maxLabelWidth, yLabels[i])
-				lines[i] = label + " " + line[idx:]
-			}
-		}
-	}
-
-	// Add the caption
-	lines = append([]string{caption}, lines...)
-
-	return strings.Join(lines, "\n")
-}
-
-// Padding function to ensure the graph extends to the current time
-func padDataToCurrentTime(data []float64, step time.Duration, dataPointsFetched int) []float64 {
-	if len(data) == 0 {
-		return data
-	}
-
-	// Calculate how much time we covered with the fetched data
-	totalDuration := time.Duration(dataPointsFetched) * step
-	now := time.Now()
-	lastDataPointTime := now.Add(-totalDuration) // Time corresponding to the first data point
-
-	// Pad data with the last value until we reach the current time
-	for lastDataPointTime.Before(now) {
-		data = append(data, data[len(data)-1]) // Repeat the last value
-		lastDataPointTime = lastDataPointTime.Add(step)
-	}
-
-	return data
+	return result
 }

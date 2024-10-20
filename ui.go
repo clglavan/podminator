@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/guptarohit/asciigraph"
 	"github.com/rivo/tview"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -228,12 +227,9 @@ func (state *AppState) setupEventHandlers() {
 									return
 								}
 
-								// Apply padding to align the data to current time
-								cpuData = padDataToCurrentTime(cpuData, time.Minute, len(cpuData))
-								memData = padDataToCurrentTime(memData, time.Minute, len(memData))
-								// Generate ASCII graphs
-								cpuGraph := asciigraph.Plot(cpuData, asciigraph.Width(80), asciigraph.Height(10), asciigraph.Caption("CPU Usage (cores)"))
-								memGraph := asciigraph.Plot(memData, asciigraph.Width(80), asciigraph.Height(10), asciigraph.Caption("Memory Usage (megabytes)"))
+								// Generate graphs using ntcharts
+								cpuGraph := state.plotCPUGraph(cpuData, "CPU Usage (milicores)")
+								memGraph := state.plotMemoryGraph(memData, "Memory Usage (megabytes)")
 
 								// Combine the graphs
 								graphText := fmt.Sprintf("%s\n\n%s", cpuGraph, memGraph)
