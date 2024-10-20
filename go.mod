@@ -3,8 +3,9 @@ module glavan.tech/podminator
 go 1.22.0
 
 require (
-	github.com/creack/pty v1.1.9
 	github.com/gdamore/tcell/v2 v2.7.4
+	github.com/prometheus/client_golang v1.20.5
+	github.com/prometheus/common v0.60.0
 	github.com/rivo/tview v0.0.0-20240921122403-a64fc48d7654
 	k8s.io/api v0.31.1
 	k8s.io/apimachinery v0.31.1
@@ -12,14 +13,24 @@ require (
 )
 
 require (
-	github.com/gdamore/tcell v1.4.0 // indirect
-	github.com/guptarohit/asciigraph v0.7.2 // indirect
-	github.com/prometheus/client_golang v1.20.5 // indirect
+	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
+	github.com/charmbracelet/bubbles v0.18.0 // indirect
+	github.com/charmbracelet/bubbletea v0.25.0 // indirect
+	github.com/charmbracelet/lipgloss v0.10.0 // indirect
+	github.com/containerd/console v1.0.4 // indirect
+	github.com/lrstanley/bubblezone v0.0.0-20240125042004-b7bafc493195 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mattn/go-localereader v0.0.1 // indirect
+	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
+	github.com/muesli/cancelreader v0.2.2 // indirect
+	github.com/muesli/reflow v0.3.0 // indirect
+	github.com/muesli/termenv v0.15.2 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect
-	github.com/prometheus/common v0.60.0 // indirect
+	golang.org/x/sync v0.8.0 // indirect
 )
 
 require (
+	github.com/NimbleMarkets/ntcharts v0.1.2
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
